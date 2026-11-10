@@ -1,0 +1,374 @@
+local Data = script.Parent:WaitForChild("Data")
+
+local Config = require(Data:WaitForChild("Config"))
+local Params = require(Data:WaitForChild("Params"))
+
+local Tokenizer = require(script.Parent:WaitForChild("Tokenizer"))
+local TransformerBlock = require(script.Parent:WaitForChild("TransformerBlock"))
+
+local API = {}
+
+local DebugLogger = require(
+	script.Parent:WaitForChild("DumpOut")
+)
+
+local RNG = Random.new()
+
+------------------------------------------------------------
+-- OUTPUT HEAD
+------------------------------------------------------------
+
+local function EnsureOutputHead()
+
+	local D = Config.Dimension
+	local VocabSize = Params.VocabSize
+
+	if not Params.Output then
+		Params.Output = {
+			W = {},
+			B = {},
+			dW = {},
+			dB = {},
+		}
+	end
+
+	for d = 1, D do
+
+		if not Params.Output.W[d] then
+			Params.Output.W[d] = {}
+		end
+
+		if not Params.Output.dW[d] then
+			Params.Output.dW[d] = {}
+		end
+
+		for ID = 0, VocabSize - 1 do
+
+			local Index = ID + 1
+
+			if Params.Output.W[d][Index] == nil then
+				Params.Output.W[d][Index] =
+					RNG:NextNumber(-0.1, 0.1)
+			end
+
+			if Params.Output.dW[d][Index] == nil then
+				Params.Output.dW[d][Index] = 0
+			end
+		end
+	end
+
+	for ID = 0, VocabSize - 1 do
+
+		local Index = ID + 1
+
+		if Params.Output.B[Index] == nil then
+			Params.Output.B[Index] = 0
+		end
+
+		if Params.Output.dB[Index] == nil then
+			Params.Output.dB[Index] = 0
+		end
+	end
+end
+
+------------------------------------------------------------
+-- LOGITS
+------------------------------------------------------------
+
+local function GetLogits(Vector)
+
+	EnsureOutputHead()
+
+	local Logits =
+		table.create(
+			Params.VocabSize
+		)
+
+	for ID = 0, Params.VocabSize - 1 do
+
+		local Index = ID + 1
+
+		local Sum =
+			Params.Output.B[Index]
+
+		for d = 1, Config.Dimension do
+
+			Sum +=
+				Vector[d]
+				* Params.Output.W[d][Index]
+
+		end
+
+		Logits[ID] = Sum
+	end
+
+	return Logits
+end
+
+------------------------------------------------------------
+-- SAMPLE
+------------------------------------------------------------
+
+local function Sample(Logits)
+
+	local Temperature =
+		Config.Temperature
+
+	if Temperature <= 0 then
+		Temperature = 0.01
+	end
+
+	local MaxValue = -math.huge
+
+	for ID = 0, Params.VocabSize - 1 do
+
+		if Logits[ID] > MaxValue then
+			MaxValue = Logits[ID]
+		end
+
+	end
+
+	local Probabilities =
+		table.create(
+			Params.VocabSize
+		)
+
+	local Sum = 0
+
+	for ID = 0, Params.VocabSize - 1 do
+
+		local Value =
+			math.exp(
+				(Logits[ID] - MaxValue)
+				/ Temperature
+			)
+
+		Probabilities[ID] = Value
+
+		Sum += Value
+	end
+
+	if Sum <= 0 then
+		Sum = 1
+	end
+
+	local RandomValue =
+		RNG:NextNumber() * Sum
+
+	local Current = 0
+
+	for ID = 0, Params.VocabSize - 1 do
+
+		Current +=
+			Probabilities[ID]
+
+		if RandomValue <= Current then
+
+			local Normalized =
+				table.create(
+					Params.VocabSize
+				)
+
+			for OtherID = 0, Params.VocabSize - 1 do
+
+				Normalized[OtherID] =
+					Probabilities[OtherID]
+					/ Sum
+
+			end
+
+			return ID, Normalized
+		end
+	end
+
+	return 0, Probabilities
+end
+
+------------------------------------------------------------
+-- GENERATION
+------------------------------------------------------------
+
+function API.GenerateText(Text, MaxTokens)
+
+	if typeof(Text) ~= "string" then
+		error(
+			"GenerateText requires a string"
+		)
+	end
+
+	MaxTokens =
+		MaxTokens
+		or Config.Model.ContextSize
+
+	--------------------------------------------------------
+	-- PROMPT
+	--------------------------------------------------------
+
+	local PromptIDs =
+		Tokenizer.EncodeIDs(Text)
+
+	local BOS =
+		Params.Vocab["<BOS>"]
+
+	local EOS =
+		Params.Vocab["<EOS>"]
+
+	local IDs = {}
+
+	if BOS ~= nil then
+		table.insert(
+			IDs,
+			BOS
+		)
+	end
+
+	for _, ID in ipairs(PromptIDs) do
+		table.insert(
+			IDs,
+			ID
+		)
+	end
+
+	if #IDs == 0 then
+		if BOS ~= nil then
+			table.insert(
+				IDs,
+				BOS
+			)
+		end
+	end
+
+	--------------------------------------------------------
+	-- GENERATION
+	--------------------------------------------------------
+
+	for Step = 1, MaxTokens do
+
+		if #IDs >= Config.Model.ContextSize then
+			break
+		end
+
+		----------------------------------------------------
+		-- EMBEDDINGS
+		----------------------------------------------------
+
+		local Hidden =
+			Tokenizer.Encode(IDs)
+
+		----------------------------------------------------
+		-- TRANSFORMER
+		----------------------------------------------------
+
+		for LayerIndex = 1, Config.Model.Layers do
+
+			Hidden =
+				TransformerBlock.Forward(
+					Hidden,
+					LayerIndex
+				)
+		end
+
+		----------------------------------------------------
+		-- LAST VECTOR
+		----------------------------------------------------
+
+		local LastVector =
+			Hidden[#Hidden]
+
+		----------------------------------------------------
+		-- LOGITS
+		----------------------------------------------------
+
+		local Logits =
+			GetLogits(
+				LastVector
+			)
+
+		----------------------------------------------------
+		-- SAMPLE
+		----------------------------------------------------
+
+		local NextID
+		local Probabilities
+
+		NextID,
+			Probabilities =
+			Sample(Logits)
+
+		----------------------------------------------------
+		-- ADD TOKEN
+		----------------------------------------------------
+
+		table.insert(
+			IDs,
+			NextID
+		)
+
+		----------------------------------------------------
+		-- DEBUG
+		----------------------------------------------------
+
+		DebugLogger.PrintStep({
+
+			Step = Step,
+
+			InputIDs = IDs,
+
+			GeneratedIDs = IDs,
+
+			LastVector = LastVector,
+
+			Logits = Logits,
+
+			Probabilities = Probabilities,
+
+			IDToToken = Params.IDToToken,
+
+			TopK = 8,
+
+		})
+
+		----------------------------------------------------
+		-- EOS
+		----------------------------------------------------
+
+		if NextID == EOS then
+			break
+		end
+
+		----------------------------------------------------
+		-- REPETITION STOP
+		----------------------------------------------------
+
+		if #IDs >= 5 then
+
+			local Last =
+				IDs[#IDs]
+
+			local Previous =
+				IDs[#IDs - 1]
+
+			local Before =
+				IDs[#IDs - 2]
+
+			if Last == Previous
+				and Previous == Before
+			then
+
+				warn(
+					"[ASTRA] Generation stopped: repetition detected"
+				)
+
+				break
+			end
+		end
+	end
+
+	--------------------------------------------------------
+	-- DECODE
+	--------------------------------------------------------
+
+	return Tokenizer.Decode(IDs)
+end
+
+return API
