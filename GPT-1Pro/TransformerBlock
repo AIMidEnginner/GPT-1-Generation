@@ -1,0 +1,461 @@
+local MHA = {}
+
+--[[
+    __  _____  ____  __________   __  ___________    ____ 
+   /  |/  / / / / / /_  __/  _/  / / / / ____/   |  / __ \
+  / /|_/ / / / / /   / /  / /   / /_/ / __/ / /| | / / / /
+ / /  / / /_/ / /___/ / _/ /   / __  / /___/ ___ |/ /_/ / 
+/_/  /_/\____/_____/_/ /___/  /_/ /_/_____/_/  |_/_____/  
+                                                          
+    ___  ___________________   ________________  _   __
+   /   |/_  __/_  __/ ____/ | / /_  __/  _/ __ \/ | / /
+  / /| | / /   / / / __/ /  |/ / / /  / // / / /  |/ / 
+ / ___ |/ /   / / / /___/ /|  / / / _/ // /_/ / /|  /  
+/_/  |_/_/   /_/ /_____/_/ |_/ /_/ /___/\____/_/ |_/   
+      
+ _    _____ 
+| |  / /__ \
+| | / /__/ /
+| |/ // __/ 
+|___//____/ 
+                                                       
+                                                          
+-- ]]
+
+local Config = require(script.Parent.Data)
+local Buffer = {}
+
+local math_sqrt = math.sqrt
+local math_tanh = math.tanh
+local math_exp = math.exp
+local math_huge = math.huge
+local Q_Buf, K_Buf, V_Buf = {}, {}, {}
+local Head_Scores_Buf = {}
+local Head_Context_Buf = {}
+local Hidden_Buffer = {}
+local Dropout_RNG = Random.new(42)
+
+-------------------------------------------------------------------
+--HELPERS
+-------------------------------------------------------------------
+
+function Softmax(vector)
+	local size = #vector
+	if size == 0 then return end
+
+	local max_val = -math_huge
+	for i = 1, size do
+		local val = vector[i]
+		if val > max_val then
+			max_val = val
+		end
+	end
+
+	-- 2. OBLICZANIE EXP + SUMOWANIE (In-place)
+	local sum = 0.0
+	for i = 1, size do
+		-- Trik z maksimum: math.exp(val - max_val)
+		local e = math_exp(vector[i] - max_val)
+		vector[i] = e
+		sum = sum + e
+	end
+
+	if sum < 1e-9 then 
+		sum = 1e-9 
+	end
+
+	local inv_sum = 1.0 / sum
+
+	for i = 1, size do
+		vector[i] = vector[i] * inv_sum
+	end
+end
+
+function matmul(A, B, out_buffer, transpose_B)
+	local M = #A     
+	local N = #A[1]  
+
+	if transpose_B then
+		local K_rows = #B 
+		for i = 1, M do
+			local row_A = A[i]
+			local row_out = out_buffer[i]
+			for j = 1, K_rows do
+				local row_B = B[j] 
+				local sum = 0.0
+				for k = 1, N do 
+					sum = sum + row_A[k] * row_B[k] 
+				end
+				row_out[j] = sum
+			end
+		end
+	else
+		-- Zabezpieczenie przed niezealokowanym jeszcze out_buffer (odczytujemy szerokość z wag B)
+		local P = #B[1] 
+
+		for i = 1, M do
+			local row_out = out_buffer[i]
+			-- Jeśli linia w buforze nie ma jeszcze odpowiedniej długości, tworzymy ją w locie
+			if not row_out or #row_out < P then
+				out_buffer[i] = table.create(P, 0.0)
+				row_out = out_buffer[i]
+			else
+				for j = 1, P do row_out[j] = 0.0 end
+			end
+		end
+
+		for i = 1, M do
+			local row_A = A[i]
+			local row_out = out_buffer[i]
+			for k = 1, N do
+				local val_A = row_A[k]
+				if val_A ~= 0.0 then
+					local row_B = B[k]
+					for j = 1, P do 
+						row_out[j] = row_out[j] + val_A * row_B[j] 
+					end
+				end
+			end
+		end
+	end
+end
+
+local function GELU(x)
+	return 0.5 * x * (1 + math_tanh(0.79788456 * x * (1 + 0.044715 * x * x)))
+end
+
+local function ApplyDropout(x)
+	if not Config.DropoutEnabled then
+		return x
+	end
+
+	if Dropout_RNG:NextNumber() < Config.Dropout then
+		return 0
+	end
+
+	return x / (1 - Config.Dropout)
+end
+
+-------------------------------------------------------------------
+--BLOCK
+-------------------------------------------------------------------
+
+function LayerNorm(X, out_buffer, weights, biases)
+	local N = #X
+	local eps = 1e-5
+	local inv_D = 0.1767766
+
+	-- Główna pętla po tokenach (wierszach sekwencji)
+	for i = 1, N do
+		local xi = X[i]
+		local out_i = out_buffer[i]
+
+		-- 1. OBLICZANIE ŚREDNIEJ (MEAN)
+		-- Unikamy funkcji pomocniczych, robimy czysty, płaski unroll w pętli
+		local sum = 0
+		for d = 1, Config.D do
+			sum = sum + xi[d]
+		end
+		local mean = sum * inv_D
+
+		-- 2. OBLICZANIE WARIANCJI (VARIANCE)
+		local variance_sum = 0
+		for d = 1, Config.D do
+			local diff = xi[d] - mean
+			variance_sum = variance_sum + diff * diff
+		end
+
+		-- Stała optymalizacja: Obliczamy odwrotność pierwiastka (rsqrt) tylko raz na token!
+		-- Dzięki temu w pętli normalizującej robimy SZYBKIE MNOŻENIE zamiast wolnego dzielenia.
+		local rsqrt = math_sqrt(variance_sum * inv_D + eps)
+		local inv_std = 1 / rsqrt
+
+		-- 3. NORMALIZACJA + ZASTOSOWANIE WAG (GAMMA/BETA)
+		-- Zapisujemy wynik prosto do przygotowanego wcześniej bufora out_i
+		for d = 1, Config.D do
+			-- Zabezpieczenie: jeśli model nie ma jeszcze wag (inicjalizacja), użyj 1.0 i 0.0
+			local g = weights and weights[d] or 1.0
+			local b = biases and biases[d] or 0.0
+
+			out_i[d] = ((xi[d] - mean) * inv_std) * g + b
+		end
+	end
+end
+function SelfAttention(X, out_buffer, layer_idx)
+	local N = #X -- Długość sekwencji (SeqLen)
+	local layer = Config.warstwy[layer_idx]
+
+	local Wq, Wk, Wv, Wo = layer.Wq, layer.Wk, layer.Wv, layer.Wo
+	local Bq, Bk, Bv, Bo = layer.Bq, layer.Bk, layer.Bv, layer.Bo
+
+	local num_heads = 4 or Config.Heads -- Powinno być 4 w Data
+	local head_dim = 8 or Config.D / num_heads -- 32 / 4 = 8
+
+	local scale = 0.35355339
+
+	-- ── KROK 1: DYNAMICZNE PRZYGOTOWANIE STRUKTURY BUFORÓW ──
+	if #Q_Buf < N then
+		for i = #Q_Buf + 1, N do
+			Q_Buf[i] = table.create(Config.D, 0.0)
+			K_Buf[i] = table.create(Config.D, 0.0)
+			V_Buf[i] = table.create(Config.D, 0.0)
+			Head_Scores_Buf[i] = table.create(N, 0.0)
+			Head_Context_Buf[i] = table.create(Config.D, 0.0)
+		end
+	end
+
+	-- ── KROK 2: PROJEKCJE Q, K, V (Linear Projections) ──
+	matmul(X, Wq, Q_Buf, false)
+	matmul(X, Wk, K_Buf, false)
+	matmul(X, Wv, V_Buf, false)
+
+	-- Dodawanie biasów in-place (jeśli istnieją w Configu)
+	if Bq and Bk and Bv then
+		for i = 1, N do
+			local q, k, v = Q_Buf[i], K_Buf[i], V_Buf[i]
+			for d = 1, Config.D do
+				q[d] = q[d] + (Bq[d] or 0.0)
+				k[d] = k[d] + (Bk[d] or 0.0)
+				v[d] = v[d] + (Bv[d] or 0.0)
+			end
+		end
+	end
+
+	-- Wyczyszczenie bufora kontekstowego
+	for i = 1, N do
+		local ctx = Head_Context_Buf[i]
+		for d = 1, Config.D do ctx[d] = 0.0 end
+	end
+
+	-- ── KROK 3: PĘTLA PO 4 GŁOWACH (Zoptymalizowana i rozwinięta pod wymiar 8) ──
+	for h = 1, num_heads do
+		-- Dynamiczny offset zależy teraz od head_dim (dla h=1: 0, dla h=2: 8, dla h=3: 16, dla h=4: 24)
+		local offset = (h - 1) * head_dim 
+
+		-- Pobieramy na sztywno indeksy dla wymiaru 8, żeby unikać pętli wewnątrz dot-product
+		local o1, o2, o3, o4 = offset + 1, offset + 2, offset + 3, offset + 4
+		local o5, o6, o7, o8 = offset + 5, offset + 6, offset + 7, offset + 8
+
+		-- Obliczanie wag uwagi (Causal Scaled Dot-Product z oknem Context_Length)
+		local ctx_window = Config.Context_Length or math_huge
+
+		for i = 1, N do
+			local q_i = Q_Buf[i]
+			local scores_i = Head_Scores_Buf[i]
+
+			local start_j = i - ctx_window + 1
+			if start_j < 1 then start_j = 1 end
+
+			-- Maskowanie w obrębie dozwolonego okna
+			for j = start_j, i do
+				local k_j = K_Buf[j]
+
+				-- ULTRA UNROLL: Pełne rozwinięcie dot-product dla 8 wymiarów głowy!
+				local dot = (q_i[o1] * k_j[o1]) 
+					+ (q_i[o2] * k_j[o2]) 
+					+ (q_i[o3] * k_j[o3]) 
+					+ (q_i[o4] * k_j[o4])
+					+ (q_i[o5] * k_j[o5]) 
+					+ (q_i[o6] * k_j[o6]) 
+					+ (q_i[o7] * k_j[o7]) 
+					+ (q_i[o8] * k_j[o8])
+
+				scores_i[j] = dot * scale
+			end
+
+			-- Blokujemy to, co starsze niż nasze okno
+			for j = 1, start_j - 1 do
+				scores_i[j] = -1e9
+			end
+
+			-- Tarcza dla przyszłości: blokujemy tokeny j > i
+			for j = i + 1, N do
+				scores_i[j] = -1e9
+			end
+
+			-- Bezpieczny i szybki Softmax in-place
+			Softmax(scores_i)
+		end
+
+		-- ── KROK 3 (KONTYNUACJA): Agregacja kontekstu (Weighted Sum) dla head_dim = 8 ──
+		for i = 1, N do
+			local scores_i = Head_Scores_Buf[i]
+			local ctx_i = Head_Context_Buf[i]
+
+			for j = 1, N do
+				local weight = scores_i[j]
+
+				-- Jeśli waga z Softmaxu jest zauważalna, dopisujemy wynik do głowy
+				if weight > 1e-8 then
+					local v_j = V_Buf[j]
+
+					-- ULTRA UNROLL: Agregacja dla wymiaru 8 bez pętli wewnętrznych!
+					ctx_i[o1] = ctx_i[o1] + weight * v_j[o1]
+					ctx_i[o2] = ctx_i[o2] + weight * v_j[o2]
+					ctx_i[o3] = ctx_i[o3] + weight * v_j[o3]
+					ctx_i[o4] = ctx_i[o4] + weight * v_j[o4]
+					ctx_i[o5] = ctx_i[o5] + weight * v_j[o5]
+					ctx_i[o6] = ctx_i[o6] + weight * v_j[o6]
+					ctx_i[o7] = ctx_i[o7] + weight * v_j[o7]
+					ctx_i[o8] = ctx_i[o8] + weight * v_j[o8]
+				end
+			end
+		end
+	end
+
+	-- ── KROK 4: PROJEKCJA WYJŚCIOWA (Output Projection Wo) ──
+	matmul(Head_Context_Buf, Wo, out_buffer, false)
+
+	if Bo then
+		for i = 1, N do
+			local out_i = out_buffer[i]
+			for d = 1, Config.D do
+				out_i[d] = out_i[d] + (Bo[d] or 0.0)
+			end
+		end
+	end
+end
+
+function FFN(X, out_buffer, network_config)
+	local N = #X
+	-- Twoje dwie warstwy z Data: pierwsza rozszerza, druga zwęża
+	local layer1 = network_config[1]
+	local layer2 = network_config[2]
+
+	local w1, b1 = layer1.Weights, layer1.Biases
+	local w2, b2 = layer2.Weights, layer2.Biases
+	
+	local HIDDEN = 64
+
+	-- Bufor dla warstwy ukrytej o stałym rozmiarze 32 (zgodnie z Twoim data)
+	if #Hidden_Buffer == 0 then
+		for i = 1, 64 do 
+			Hidden_Buffer[i] = 0.0 
+		end
+	end
+
+	for i = 1, N do
+		local xi = X[i]
+		local out_i = out_buffer[i]
+
+		for h = 1, HIDDEN do
+			local w1_h = w1[h]
+			local sum = b1[h] or 0.0
+
+			for d = 1, Config.D do 
+				sum = sum + xi[d] * w1_h[d]
+			end
+
+			Hidden_Buffer[h] = GELU(sum)
+		end
+
+		for d = 1, Config.D do
+			local w2_d = w2[d]
+			local sum = b2[d] or 0.0
+
+			for h = 1, HIDDEN do
+				sum = sum + Hidden_Buffer[h] * w2_d[h]
+			end
+
+			out_i[d] = sum
+		end
+	end
+end
+-- ============================================================
+--  GŁÓWNY PRZEPŁYW WARSTW (Forward Control GPT-2 Pre-LN)
+-- ============================================================
+function MHA.Forward(SequenceMatrix)
+
+	-- Klonujemy wejście na start do głównego wątku (Wątek Residualny)
+	local seq = table.create(#SequenceMatrix)
+	for i = 1, #SequenceMatrix do 
+		seq[i] = table.clone(SequenceMatrix[i]) 
+	end
+
+	local N = #seq
+	local max_allowed = Config.Context_Length or 1024
+	if N > max_allowed then
+		error("Za długi kontekst! Limit z configu to " .. max_allowed .. " tokenów, a masz weszło: " .. N)
+	end
+
+	local num_layers = Config.num_layers or 24 -- Twoje wymarzone 24 warstwy
+
+	-- Alokacja głównych buforów warstwy dopasowana do faktycznego limitu okna/kontekstu
+	if not Buffer.LN_Out then
+		Buffer.LN_Out = table.create(max_allowed)
+		Buffer.Block_Out = table.create(max_allowed)
+		for i = 1, max_allowed do
+			Buffer.LN_Out[i] = table.create(Config.D, 0.0)
+			Buffer.Block_Out[i] = table.create(Config.D, 0.0)
+		end
+		Buffer.Final_LN_Out = table.create(max_allowed)
+		for i = 1, max_allowed do
+			Buffer.Final_LN_Out[i] = table.create(Config.D, 0.0)
+		end
+	end
+
+	-- Główna pętla przez bloki Transformera (Pre-LN Residual Stream)
+	for layer_idx = 1, num_layers do
+		local layer = Config.warstwy[layer_idx]
+
+		-------------------------------------------------------
+		-- KROK 1: PRE-LN 1 -> SELF-ATTENTION -> RESIDUAL
+		-------------------------------------------------------
+		LayerNorm(seq, Buffer.LN_Out, layer.LN1_gamma, layer.LN1_beta)
+		SelfAttention(Buffer.LN_Out, Buffer.Block_Out, layer_idx)
+
+		if Config.DropoutEnabled then
+			for i = 1, N do
+				local b = Buffer.Block_Out[i]
+				for d = 1, Config.D do
+					b[d] = ApplyDropout(b[d])
+				end
+			end
+		end
+
+		-- Dodawanie do głównego nurtu (In-place)
+		for i = 1, N do
+			local s = seq[i]
+			local b = Buffer.Block_Out[i]
+			for d = 1, Config.D do 
+				s[d] = s[d] + b[d] 
+			end
+		end
+
+		-------------------------------------------------------
+		-- KROK 2: PRE-LN 2 -> FEED-FORWARD -> RESIDUAL
+		-------------------------------------------------------
+		LayerNorm(seq, Buffer.LN_Out, layer.LN2_gamma, layer.LN2_beta)
+		FFN(Buffer.LN_Out, Buffer.Block_Out, Config.FeedForward)
+
+		if Config.DropoutEnabled then
+			for i = 1, N do
+				local b = Buffer.Block_Out[i]
+				for d = 1, Config.D do
+					b[d] = ApplyDropout(b[d])
+				end
+			end
+		end
+
+		-- Dodawanie do głównego nurtu (In-place)
+		for i = 1, N do
+			local s = seq[i]
+			local b = Buffer.Block_Out[i]
+			for d = 1, Config.D do 
+				s[d] = s[d] + b[d] 
+			end
+		end
+	end
+
+	LayerNorm(
+		seq,
+		Buffer.Final_LN_Out,
+		Config.Final_LN_gamma,
+		Config.Final_LN_beta
+	)
+
+	return Buffer.Final_LN_Out
+end
+
+
+return MHA
