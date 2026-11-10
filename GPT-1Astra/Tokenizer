@@ -1,0 +1,440 @@
+local Data = script.Parent:WaitForChild("Data")
+local Config = require(Data:WaitForChild("Config"))
+local Params = require(Data:WaitForChild("Params"))
+
+local Tokenizer = {}
+
+local RNG = Random.new()
+
+local function NormalizeText(Text)
+	return string.lower(tostring(Text))
+end
+
+local function AddToken(Token)
+	if Params.Vocab[Token] ~= nil then
+		return Params.Vocab[Token]
+	end
+
+	local ID = Params.VocabSize
+
+	Params.Vocab[Token] = ID
+	Params.IDToToken[ID] = Token
+	Params.VocabSize += 1
+
+	local Vector = {}
+
+	for i = 1, Config.Dimension do
+		Vector[i] = RNG:NextNumber(-0.1, 0.1)
+	end
+
+	Params.Embedding[ID] = Vector
+
+	return ID
+end
+
+local function SplitWords(Text)
+	local Words = {}
+
+	for Word in string.gmatch(Text, "%S+") do
+		table.insert(Words, Word)
+	end
+
+	return Words
+end
+
+local function SplitCharacters(Text)
+	local Characters = {}
+
+	for _, Codepoint in utf8.codes(Text) do
+		table.insert(Characters, utf8.char(Codepoint))
+	end
+
+	return Characters
+end
+
+local function CountPairs(Sequences)
+	local Counts = {}
+
+	for _, Sequence in ipairs(Sequences) do
+		for i = 1, #Sequence - 1 do
+			local A = Sequence[i]
+			local B = Sequence[i + 1]
+			local Key = A .. "\0" .. B
+
+			Counts[Key] = (Counts[Key] or 0) + 1
+		end
+	end
+
+	return Counts
+end
+
+local function MergePair(Sequence, A, B)
+	local Result = {}
+	local i = 1
+
+	while i <= #Sequence do
+		if i < #Sequence
+			and Sequence[i] == A
+			and Sequence[i + 1] == B
+		then
+			table.insert(Result, A .. B)
+			i += 2
+		else
+			table.insert(Result, Sequence[i])
+			i += 1
+		end
+	end
+
+	return Result
+end
+
+local function ApplyMerges(Sequence)
+	for _, Merge in ipairs(Params.Merges) do
+		Sequence = MergePair(
+			Sequence,
+			Merge[1],
+			Merge[2]
+		)
+	end
+
+	return Sequence
+end
+
+local function GetTokens(Text)
+	Text = NormalizeText(Text)
+
+	local Mode = Config.Tokenizer.Mode
+	local Tokens = {}
+
+	if Mode == "Character" then
+
+		for _, Codepoint in utf8.codes(Text) do
+			table.insert(
+				Tokens,
+				utf8.char(Codepoint)
+			)
+		end
+
+	elseif Mode == "Word" then
+
+		for _, Word in ipairs(SplitWords(Text)) do
+			table.insert(Tokens, Word)
+		end
+
+	elseif Mode == "Subword" then
+
+		for _, Word in ipairs(SplitWords(Text)) do
+			local Sequence = SplitCharacters(Word)
+			Sequence = ApplyMerges(Sequence)
+
+			for _, Token in ipairs(Sequence) do
+				table.insert(Tokens, Token)
+			end
+		end
+
+	else
+		error(
+			"Unknown tokenizer mode: "
+				.. tostring(Mode)
+		)
+	end
+
+	return Tokens
+end
+
+local function GetPositionVector(Position)
+	local Vector = {}
+
+	for i = 1, Config.Dimension do
+		local Index = i - 1
+		local Angle = Position / (10000 ^ (Index / Config.Dimension))
+
+		if Index % 2 == 0 then
+			Vector[i] = math.sin(Angle)
+		else
+			Vector[i] = math.cos(Angle)
+		end
+	end
+
+	return Vector
+end
+
+local function AddPosition(Vector, Position)
+	if not Config.PositionalEncoding.Enabled then
+		return Vector
+	end
+
+	local PositionVector = GetPositionVector(Position)
+	local Result = {}
+
+	local Added = Config.PositionalEncoding.Added
+	local Multi = Config.PositionalEncoding.Multi
+
+	for i = 1, Config.Dimension do
+		PositionVector[i] =
+			(PositionVector[i] + Added) * Multi
+
+		Result[i] =
+			Vector[i] + PositionVector[i]
+	end
+
+	return Result
+end
+
+function Tokenizer.Train(Text)
+	Text = NormalizeText(Text)
+
+	local Mode = Config.Tokenizer.Mode
+
+	if Mode == "Character" or Mode == "Word" then
+
+		for _, Token in ipairs(GetTokens(Text)) do
+			AddToken(Token)
+		end
+
+	elseif Mode == "Subword" then
+
+		local Sequences = {}
+
+		for _, Word in ipairs(SplitWords(Text)) do
+			local Sequence = SplitCharacters(Word)
+
+			for _, Token in ipairs(Sequence) do
+				AddToken(Token)
+			end
+
+			table.insert(Sequences, Sequence)
+		end
+
+		local TargetSize =
+			Config.Tokenizer.VocabSize
+			or 1000
+
+		while Params.VocabSize < TargetSize do
+			local Counts = CountPairs(Sequences)
+
+			local BestA
+			local BestB
+			local BestCount = 0
+
+			for Key, Count in pairs(Counts) do
+				if Count > BestCount then
+					local A, B = string.match(
+						Key,
+						"^(.-)%z(.*)$"
+					)
+
+					BestA = A
+					BestB = B
+					BestCount = Count
+				end
+			end
+
+			if not BestA then
+				break
+			end
+
+			table.insert(
+				Params.Merges,
+				{BestA, BestB}
+			)
+
+			AddToken(BestA .. BestB)
+
+			for i, Sequence in ipairs(Sequences) do
+				Sequences[i] = MergePair(
+					Sequence,
+					BestA,
+					BestB
+				)
+			end
+		end
+	else
+		error(
+			"Unknown tokenizer mode: "
+				.. tostring(Mode)
+		)
+	end
+end
+
+function Tokenizer.Encode(Input)
+	local Output = {}
+
+	if typeof(Input) == "table" then
+		for Position, ID in ipairs(Input) do
+			local Embedding = Params.Embedding[ID]
+
+			if not Embedding then
+				error(
+					"Missing embedding for token ID: "
+						.. tostring(ID)
+				)
+			end
+
+			local Vector = table.create(Config.Dimension)
+
+			if Config.PositionalEncoding.Enabled then
+				local Added = Config.PositionalEncoding.Added
+				local Multi = Config.PositionalEncoding.Multi
+
+				for i = 1, Config.Dimension do
+					local Index = i - 1
+					local Angle =
+						(Position - 1)
+						/ (10000 ^ (Index / Config.Dimension))
+
+					local Positional
+
+					if Index % 2 == 0 then
+						Positional = math.sin(Angle)
+					else
+						Positional = math.cos(Angle)
+					end
+
+					Positional =
+						(Positional + Added) * Multi
+
+					Vector[i] =
+						Embedding[i] + Positional
+				end
+			else
+				for i = 1, Config.Dimension do
+					Vector[i] = Embedding[i]
+				end
+			end
+
+			table.insert(Output, Vector)
+		end
+
+		return Output
+	end
+
+	local Tokens = GetTokens(Input)
+
+	for Position, Token in ipairs(Tokens) do
+		local ID = Params.Vocab[Token]
+
+		if not ID then
+			ID = Params.Vocab["<UNK>"]
+		end
+
+		local Embedding = Params.Embedding[ID]
+
+		if not Embedding then
+			error(
+				"Missing embedding for token ID: "
+					.. tostring(ID)
+			)
+		end
+
+		local Vector = table.create(Config.Dimension)
+
+		if Config.PositionalEncoding.Enabled then
+			local Added = Config.PositionalEncoding.Added
+			local Multi = Config.PositionalEncoding.Multi
+
+			for i = 1, Config.Dimension do
+				local Index = i - 1
+				local Angle =
+					(Position - 1)
+					/ (10000 ^ (Index / Config.Dimension))
+
+				local Positional
+
+				if Index % 2 == 0 then
+					Positional = math.sin(Angle)
+				else
+					Positional = math.cos(Angle)
+				end
+
+				Positional =
+					(Positional + Added) * Multi
+
+				Vector[i] =
+					Embedding[i] + Positional
+			end
+		else
+			for i = 1, Config.Dimension do
+				Vector[i] = Embedding[i]
+			end
+		end
+
+		table.insert(Output, Vector)
+	end
+
+	return Output
+end
+
+function Tokenizer.EncodeIDs(Text)
+	local Tokens = GetTokens(Text)
+	local IDs = {}
+
+	for _, Token in ipairs(Tokens) do
+		table.insert(
+			IDs,
+			Params.Vocab[Token]
+				or Params.Vocab["<UNK>"]
+		)
+	end
+
+	return IDs
+end
+
+function Tokenizer.Decode(IDs)
+	local Tokens = {}
+
+	for _, ID in ipairs(IDs) do
+		local Token = Params.IDToToken[ID]
+
+		if Token
+			and Token ~= "<PAD>"
+			and Token ~= "<BOS>"
+			and Token ~= "<EOS>"
+			and Token ~= "<SEP>"
+		then
+			table.insert(Tokens, Token)
+		end
+	end
+
+	if Config.Tokenizer.Mode == "Character" then
+		return table.concat(Tokens)
+	end
+
+	return table.concat(Tokens, " ")
+end
+
+function Tokenizer.GetVocab()
+	return Params.Vocab
+end
+
+function Tokenizer.GetVocabSize()
+	return Params.VocabSize
+end
+
+function Tokenizer.GetEmbedding(ID)
+	return Params.Embedding[ID]
+end
+
+function Tokenizer.Reset()
+	Params.Vocab = {
+		["<PAD>"] = 0,
+		["<UNK>"] = 1,
+		["<BOS>"] = 2,
+		["<EOS>"] = 3,
+		["<SEP>"] = 4,
+	}
+
+	Params.IDToToken = {
+		[0] = "<PAD>",
+		[1] = "<UNK>",
+		[2] = "<BOS>",
+		[3] = "<EOS>",
+		[4] = "<SEP>",
+	}
+
+	Params.VocabSize = 5
+	Params.Merges = {}
+	Params.Embedding = {}
+end
+
+return Tokenizer
