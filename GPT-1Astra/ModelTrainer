@@ -1,0 +1,846 @@
+local Data = script.Parent:WaitForChild("Data")
+local Config = require(Data:WaitForChild("Config"))
+local Params = require(Data:WaitForChild("Params"))
+
+local Tokenizer = require(script.Parent:WaitForChild("Tokenizer"))
+local TransformerBlock = require(script.Parent:WaitForChild("TransformerBlock"))
+
+local Trainer = {}
+
+local RNG = Random.new(1234)
+
+local D = Config.Dimension
+local Layers = Config.Model.Layers
+local ContextSize = Config.Model.ContextSize
+
+local YieldInterval =
+	Config.Training.YieldInterval
+	or 0.01
+
+local LastYield = os.clock()
+
+----------------------------------------------------------------
+-- YIELD
+----------------------------------------------------------------
+
+local function Yield()
+	if os.clock() - LastYield >= YieldInterval then
+		task.wait()
+		LastYield = os.clock()
+	end
+end
+
+----------------------------------------------------------------
+-- HELPERS
+----------------------------------------------------------------
+
+local function Shuffle(Array)
+	for i = #Array, 2, -1 do
+		local j = RNG:NextInteger(1, i)
+		Array[i], Array[j] = Array[j], Array[i]
+	end
+end
+
+local function ZeroVector(Vector)
+	for i = 1, #Vector do
+		Vector[i] = 0
+	end
+end
+
+local function ZeroMatrix(Matrix)
+	for i = 1, #Matrix do
+		local Row = Matrix[i]
+
+		for j = 1, #Row do
+			Row[j] = 0
+		end
+
+		Yield()
+	end
+end
+
+----------------------------------------------------------------
+-- OUTPUT HEAD
+----------------------------------------------------------------
+
+local function EnsureOutputHead()
+	if not Params.Output then
+		Params.Output = {
+			W = {},
+			B = {},
+			dW = {},
+			dB = {},
+		}
+	end
+
+	for d = 1, D do
+		Params.Output.W[d] =
+			Params.Output.W[d] or {}
+
+		Params.Output.dW[d] =
+			Params.Output.dW[d] or {}
+
+		for ID = 0, Params.VocabSize - 1 do
+			local Index = ID + 1
+
+			if Params.Output.W[d][Index] == nil then
+				Params.Output.W[d][Index] =
+					RNG:NextNumber(-0.1, 0.1)
+			end
+
+			if Params.Output.dW[d][Index] == nil then
+				Params.Output.dW[d][Index] = 0
+			end
+		end
+
+		Yield()
+	end
+
+	for ID = 0, Params.VocabSize - 1 do
+		local Index = ID + 1
+
+		if Params.Output.B[Index] == nil then
+			Params.Output.B[Index] = 0
+		end
+
+		if Params.Output.dB[Index] == nil then
+			Params.Output.dB[Index] = 0
+		end
+	end
+end
+
+----------------------------------------------------------------
+-- EMBEDDING GRADIENT
+----------------------------------------------------------------
+
+local ActiveEmbeddingIDs = {}
+local ActiveEmbeddingMap = {}
+
+local function EnsureEmbeddingGradient(ID)
+	Params.Gradients.Embedding =
+		Params.Gradients.Embedding or {}
+
+	if not Params.Gradients.Embedding[ID] then
+		Params.Gradients.Embedding[ID] =
+			table.create(D, 0)
+
+		for d = 1, D do
+			Params.Gradients.Embedding[ID][d] = 0
+		end
+	end
+
+	return Params.Gradients.Embedding[ID]
+end
+
+----------------------------------------------------------------
+-- GRADIENTS
+----------------------------------------------------------------
+
+local function ClearGradients()
+	for LayerIndex = 1, Layers do
+		local Grad =
+			Params.Gradients[LayerIndex]
+
+		ZeroMatrix(Grad.dWq)
+		ZeroMatrix(Grad.dWk)
+		ZeroMatrix(Grad.dWv)
+		ZeroMatrix(Grad.dWo)
+
+		ZeroVector(Grad.dBq)
+		ZeroVector(Grad.dBk)
+		ZeroVector(Grad.dBv)
+		ZeroVector(Grad.dBo)
+
+		ZeroVector(Grad.dLN1_Gamma)
+		ZeroVector(Grad.dLN1_Beta)
+
+		ZeroMatrix(Grad.dW1)
+		ZeroVector(Grad.dB1)
+
+		ZeroMatrix(Grad.dW2)
+		ZeroVector(Grad.dB2)
+
+		ZeroVector(Grad.dLN2_Gamma)
+		ZeroVector(Grad.dLN2_Beta)
+
+		Yield()
+	end
+
+	------------------------------------------------------------
+	-- OUTPUT
+	------------------------------------------------------------
+
+	ZeroMatrix(Params.Output.dW)
+	ZeroVector(Params.Output.dB)
+
+	------------------------------------------------------------
+	-- TYLKO EMBEDDINGI Z POPRZEDNIEGO PRZYKŁADU
+	------------------------------------------------------------
+
+	Params.Gradients.Embedding =
+		Params.Gradients.Embedding or {}
+
+	for i = 1, #ActiveEmbeddingIDs do
+		local ID = ActiveEmbeddingIDs[i]
+		local Gradient =
+			Params.Gradients.Embedding[ID]
+
+		if Gradient then
+			ZeroVector(Gradient)
+		end
+	end
+
+	table.clear(ActiveEmbeddingIDs)
+	table.clear(ActiveEmbeddingMap)
+end
+
+----------------------------------------------------------------
+-- OUTPUT
+----------------------------------------------------------------
+
+local function GetLogits(Vector)
+	local VocabSize = Params.VocabSize
+	local Output = Params.Output
+
+	local Logits =
+		table.create(VocabSize)
+
+	for ID = 0, VocabSize - 1 do
+		local Index = ID + 1
+		local Sum = Output.B[Index]
+
+		for d = 1, D do
+			Sum +=
+				Vector[d]
+				* Output.W[d][Index]
+		end
+
+		Logits[ID] = Sum
+	end
+
+	return Logits
+end
+
+local function Softmax(Logits)
+	local MaxValue = -math.huge
+
+	for ID = 0, Params.VocabSize - 1 do
+		local Value = Logits[ID]
+
+		if Value > MaxValue then
+			MaxValue = Value
+		end
+	end
+
+	local Probabilities =
+		table.create(Params.VocabSize)
+
+	local Sum = 0
+
+	for ID = 0, Params.VocabSize - 1 do
+		local Value =
+			math.exp(
+				Logits[ID] - MaxValue
+			)
+
+		Probabilities[ID] = Value
+		Sum += Value
+	end
+
+	if Sum < 1e-12 then
+		Sum = 1e-12
+	end
+
+	local InvSum = 1 / Sum
+
+	for ID = 0, Params.VocabSize - 1 do
+		Probabilities[ID] *= InvSum
+	end
+
+	return Probabilities
+end
+
+local function OutputBackward(
+	Hidden,
+	TargetID,
+	GradientScale
+)
+	local Logits =
+		GetLogits(Hidden)
+
+	local Probabilities =
+		Softmax(Logits)
+
+	local DHidden =
+		table.create(D, 0)
+
+	local Probability =
+		math.max(
+			Probabilities[TargetID],
+			1e-12
+		)
+
+	local Output = Params.Output
+
+	for ID = 0, Params.VocabSize - 1 do
+		local Index = ID + 1
+
+		local DLogit =
+			Probabilities[ID]
+
+		if ID == TargetID then
+			DLogit -= 1
+		end
+
+		DLogit *= GradientScale
+
+		Output.dB[Index] += DLogit
+
+		for d = 1, D do
+			Output.dW[d][Index] +=
+				Hidden[d] * DLogit
+
+			DHidden[d] +=
+				Output.W[d][Index]
+				* DLogit
+		end
+	end
+
+	return -math.log(Probability), DHidden
+end
+
+----------------------------------------------------------------
+-- FORWARD
+----------------------------------------------------------------
+
+local function Forward(InputIDs)
+	local Sequence =
+		Tokenizer.Encode(InputIDs)
+
+	for LayerIndex = 1, Layers do
+		Sequence =
+			TransformerBlock.Forward(
+				Sequence,
+				LayerIndex
+			)
+
+		Yield()
+	end
+
+	return Sequence
+end
+
+----------------------------------------------------------------
+-- EMBEDDING GRADIENT
+----------------------------------------------------------------
+
+local function AccumulateEmbeddingGradient(
+	InputIDs,
+	DHidden
+)
+	for i = 1, #InputIDs do
+		local ID = InputIDs[i]
+
+		local Gradient =
+			EnsureEmbeddingGradient(ID)
+
+		if not ActiveEmbeddingMap[ID] then
+			ActiveEmbeddingMap[ID] = true
+			ActiveEmbeddingIDs[
+			#ActiveEmbeddingIDs + 1
+			] = ID
+		end
+
+		local DHi = DHidden[i]
+
+		for d = 1, D do
+			Gradient[d] += DHi[d]
+		end
+	end
+end
+
+----------------------------------------------------------------
+-- UPDATE
+----------------------------------------------------------------
+
+local function UpdateParameters()
+	local LearningRate =
+		Config.Training.LearningRate
+
+	------------------------------------------------------------
+	-- TRANSFORMER
+	------------------------------------------------------------
+
+	for LayerIndex = 1, Layers do
+		local Layer =
+			Params.Layers[LayerIndex]
+
+		local Grad =
+			Params.Gradients[LayerIndex]
+
+		for i = 1, D do
+			local WqI = Layer.Wq[i]
+			local WkI = Layer.Wk[i]
+			local WvI = Layer.Wv[i]
+			local WoI = Layer.Wo[i]
+
+			local dWqI = Grad.dWq[i]
+			local dWkI = Grad.dWk[i]
+			local dWvI = Grad.dWv[i]
+			local dWoI = Grad.dWo[i]
+
+			for j = 1, D do
+				WqI[j] -= LearningRate * dWqI[j]
+				WkI[j] -= LearningRate * dWkI[j]
+				WvI[j] -= LearningRate * dWvI[j]
+				WoI[j] -= LearningRate * dWoI[j]
+			end
+		end
+
+		for d = 1, D do
+			Layer.Bq[d] -=
+				LearningRate * Grad.dBq[d]
+
+			Layer.Bk[d] -=
+				LearningRate * Grad.dBk[d]
+
+			Layer.Bv[d] -=
+				LearningRate * Grad.dBv[d]
+
+			Layer.Bo[d] -=
+				LearningRate * Grad.dBo[d]
+
+			Layer.LN1_Gamma[d] -=
+				LearningRate
+				* Grad.dLN1_Gamma[d]
+
+			Layer.LN1_Beta[d] -=
+				LearningRate
+				* Grad.dLN1_Beta[d]
+
+			Layer.B2[d] -=
+				LearningRate * Grad.dB2[d]
+
+			Layer.LN2_Gamma[d] -=
+				LearningRate
+				* Grad.dLN2_Gamma[d]
+
+			Layer.LN2_Beta[d] -=
+				LearningRate
+				* Grad.dLN2_Beta[d]
+		end
+
+		for h = 1, #Layer.B1 do
+			Layer.B1[h] -=
+				LearningRate * Grad.dB1[h]
+		end
+
+		for h = 1, #Layer.W1 do
+			local W1Row = Layer.W1[h]
+			local dW1Row = Grad.dW1[h]
+
+			for d = 1, D do
+				W1Row[d] -=
+					LearningRate * dW1Row[d]
+			end
+		end
+
+		for d = 1, #Layer.W2 do
+			local W2Row = Layer.W2[d]
+			local dW2Row = Grad.dW2[d]
+
+			for h = 1, #W2Row do
+				W2Row[h] -=
+					LearningRate * dW2Row[h]
+			end
+		end
+
+		Yield()
+	end
+
+	------------------------------------------------------------
+	-- OUTPUT
+	------------------------------------------------------------
+
+	local Output = Params.Output
+
+	for d = 1, D do
+		local WRow = Output.W[d]
+		local dWRow = Output.dW[d]
+
+		for Index = 1, Params.VocabSize do
+			WRow[Index] -=
+				LearningRate * dWRow[Index]
+		end
+	end
+
+	for Index = 1, Params.VocabSize do
+		Output.B[Index] -=
+			LearningRate * Output.dB[Index]
+	end
+
+	------------------------------------------------------------
+	-- EMBEDDINGS
+	------------------------------------------------------------
+
+	for i = 1, #ActiveEmbeddingIDs do
+		local ID = ActiveEmbeddingIDs[i]
+
+		local Gradient =
+			Params.Gradients.Embedding[ID]
+
+		local Embedding =
+			Params.Embedding[ID]
+
+		if Embedding then
+			for d = 1, D do
+				Embedding[d] -=
+					LearningRate * Gradient[d]
+			end
+		end
+	end
+
+	Yield()
+end
+
+----------------------------------------------------------------
+-- TOKENIZER TRAINING
+----------------------------------------------------------------
+
+local function CollectTexts(
+	DataSet,
+	Result
+)
+	for _, Value in pairs(DataSet) do
+		if typeof(Value) == "string" then
+			Result[#Result + 1] = Value
+
+		elseif typeof(Value) == "table" then
+			CollectTexts(
+				Value,
+				Result
+			)
+		end
+
+		Yield()
+	end
+end
+
+function Trainer.TrainTokenizer(DataSet)
+	if typeof(DataSet) ~= "table" then
+		error(
+			"TrainTokenizer requires a table"
+		)
+	end
+
+	local Texts = {}
+
+	CollectTexts(
+		DataSet,
+		Texts
+	)
+
+	if #Texts == 0 then
+		error(
+			"TrainTokenizer received an empty dataset"
+		)
+	end
+
+	local Corpus =
+		table.concat(
+			Texts,
+			"\n"
+		)
+
+	Tokenizer.Train(Corpus)
+
+	EnsureOutputHead()
+
+	print(
+		"[ASTRA] Tokenizer trained | VocabSize:",
+		Params.VocabSize
+	)
+
+	task.wait()
+	LastYield = os.clock()
+end
+
+----------------------------------------------------------------
+-- EXAMPLE
+----------------------------------------------------------------
+
+local function TrainExample(Text)
+	if typeof(Text) ~= "string" then
+		return nil
+	end
+
+	local InputIDs =
+		Tokenizer.EncodeIDs(Text)
+	
+	table.insert(
+		InputIDs,
+		1,
+		Params.Vocab["<BOS>"]
+	)
+
+	table.insert(
+		InputIDs,
+		Params.Vocab["<EOS>"]
+	)
+
+
+	if #InputIDs < 2 then
+		return nil
+	end
+
+	if #InputIDs > ContextSize then
+		local Start =
+			#InputIDs
+		- ContextSize
+			+ 1
+
+		local Trimmed =
+			table.create(ContextSize)
+
+		for i = 1, ContextSize do
+			Trimmed[i] =
+				InputIDs[
+			Start + i - 1
+			]
+		end
+
+		InputIDs = Trimmed
+	end
+
+	ClearGradients()
+
+	local Hidden =
+		Forward(InputIDs)
+
+	local TokenCount =
+		#InputIDs - 1
+
+	if TokenCount <= 0 then
+		return nil
+	end
+
+	local TotalLoss = 0
+
+	local DHidden =
+		table.create(#Hidden)
+
+	for i = 1, #Hidden do
+		DHidden[i] =
+			table.create(D, 0)
+	end
+
+	local GradientScale =
+		1 / TokenCount
+
+	for i = 1, TokenCount do
+		local TargetID =
+			InputIDs[i + 1]
+
+		local Loss, Gradient =
+			OutputBackward(
+				Hidden[i],
+				TargetID,
+				GradientScale
+			)
+
+		TotalLoss += Loss
+
+		local DHi = DHidden[i]
+
+		for d = 1, D do
+			DHi[d] = Gradient[d]
+		end
+
+		Yield()
+	end
+
+	for LayerIndex = Layers, 1, -1 do
+		DHidden =
+			TransformerBlock.Backward(
+				DHidden,
+				LayerIndex
+			)
+
+		Yield()
+	end
+
+	AccumulateEmbeddingGradient(
+		InputIDs,
+		DHidden
+	)
+
+	UpdateParameters()
+
+	return TotalLoss / TokenCount
+end
+
+----------------------------------------------------------------
+-- STAGE
+----------------------------------------------------------------
+local function TrainStage(
+	Stage,
+	DataSet
+)
+	if not Stage.Enabled then
+		return
+	end
+
+	if typeof(DataSet) ~= "table" then
+		error(
+			"Dataset for stage "
+				.. tostring(Stage.Name)
+				.. " is missing"
+		)
+	end
+
+	local Epochs =
+		Stage.Epochs
+		or Config.Training.Epochs
+
+	local WorkData =
+		table.clone(DataSet)
+
+	local ProgressStep =
+		math.max(
+			1,
+			math.floor(#WorkData / 20)
+		)
+
+	for Epoch = 1, Epochs do
+		if Config.Training.ShuffleData then
+			Shuffle(WorkData)
+		end
+
+
+
+		local TotalLoss = 0
+		local Examples = 0
+
+		for Index, Text in ipairs(WorkData) do
+			local Loss =
+				TrainExample(Text)
+
+			if Loss then
+				TotalLoss += Loss
+				Examples += 1
+			end
+
+			if Index % ProgressStep == 0
+				or Index == #WorkData
+			then
+				local Percent =
+					(Index / #WorkData) * 100
+
+			end
+
+			Yield()
+		end
+
+		local AverageLoss =
+			Examples > 0
+			and TotalLoss / Examples
+			or 0
+
+		print(
+			string.format(
+				"[ASTRA] %s | Epoch %d/%d | Complete | Loss %.6f",
+				Stage.Name,
+				Epoch,
+				Epochs,
+				AverageLoss
+			)
+		)
+
+		task.wait()
+		LastYield = os.clock()
+	end
+end
+----------------------------------------------------------------
+-- MAIN
+----------------------------------------------------------------
+
+function Trainer.Train(DataSet)
+	if typeof(DataSet) ~= "table" then
+		error(
+			"Trainer.Train requires a table"
+		)
+	end
+	
+	Params.Initialize(Config)
+
+	Params.Gradients.Embedding =
+		Params.Gradients.Embedding
+		or {}
+
+	print(
+		"[ASTRA] Training tokenizer..."
+	)
+
+	Trainer.TrainTokenizer(DataSet)
+
+	if Config.Training.Mode == "SingleStage" then
+
+		TrainStage(
+			{
+				Name = "Training",
+				Enabled = true,
+				Epochs =
+					Config.Training.Epochs,
+			},
+			DataSet
+		)
+
+	elseif Config.Training.Mode == "MultiStage" then
+
+		for _, Stage in ipairs(Config.Stages) do
+			if Stage.Enabled then
+
+				local StageData =
+					DataSet[Stage.Name]
+
+				if not StageData then
+					error(
+						"No dataset for stage "
+							.. tostring(Stage.Name)
+					)
+				end
+
+				TrainStage(
+					Stage,
+					StageData
+				)
+			end
+
+			Yield()
+		end
+
+	else
+		error(
+			"Unknown training mode: "
+				.. tostring(Config.Training.Mode)
+		)
+	end
+	
+	Params.ExportWeights()
+
+	print("[ASTRA] Training complete.")
+end
+
+----------------------------------------------------------------
+-- PUBLIC
+----------------------------------------------------------------
+
+function Trainer.TrainExample(Text)
+	return TrainExample(Text)
+end
+
+function Trainer.ClearGradients()
+	ClearGradients()
+end
+
+return Trainer
