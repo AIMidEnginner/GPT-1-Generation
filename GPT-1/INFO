@@ -1,0 +1,43 @@
+local a = [[
+	GPT-1
+
+	Model: Decoder-Only Transformer
+
+	──────────────────────────────
+	SPECYFIKACJA
+	──────────────────────────────
+
+	• Architektura: Decoder-Only
+	• Transformer Block: ✔
+	• Multi-Head Attention: Implementacja (nieukończona)
+	• Feed Forward Network:
+	    16 → 32 → 16
+	• Hidden Dimension: 16
+	• Context Length: 7 tokenów
+
+	──────────────────────────────
+	STATUS
+	──────────────────────────────
+
+	⚠ Multi-Head Attention obecnie nie działa poprawnie.
+
+	Powód:
+	Brakuje logiki odpowiedzialnej za działanie poszczególnych głów (Attention Heads), 
+	przez co cały moduł zachowuje się jak niedokończona implementacja.
+
+	──────────────────────────────
+	CEL MODELU
+	──────────────────────────────
+
+	GPT-1 nie był tworzony jako model produkcyjny.
+
+	Jego głównym celem było:
+
+	• zrozumienie architektury Decoder-Only,
+	• nauczenie się budowy bloków Transformera,
+	• poznanie działania Self-Attention,
+	• przygotowanie wiedzy potrzebnej do stworzenia GPT-2.
+
+	Model pełni rolę pierwszego eksperymentu i fundamentu dla kolejnych wersji architektury.
+
+]]
