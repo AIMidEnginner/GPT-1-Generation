@@ -1,1 +1,2 @@
-# GPT-1-GENERATION
+## 3 Modele Generacji 1
+
