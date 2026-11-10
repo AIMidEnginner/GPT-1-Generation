@@ -1,0 +1,106 @@
+local Tokenizer = {}
+local Config = require(script.Parent.Data)
+
+-- Cache wzorców gsub (Roblox kompiluje je przy każdym wywołaniu)
+local PATTERN_DOT = "%."
+local PATTERN_PUNCT = "[%,%!%?%:%;%\"%(%)%-%_]"
+local PATTERN_WORDS = "%S+"
+
+-- [POPRAWKA GPT-2]: Fallback cache dostosowany do nowego wymiaru D = 32
+local ZERO_VECTOR = {}
+for i = 1, 32 do ZERO_VECTOR[i] = 0.0 end
+
+function Tokenizer.CleanText(text)
+	return string.gsub(string.gsub(string.lower(text), PATTERN_DOT, " . "), PATTERN_PUNCT, "")
+end
+
+function Tokenizer.BuildVocab(raw_text)
+	local cleaned = Tokenizer.CleanText(raw_text)
+	local unique_words = { ["<STOP>"] = true }
+	local vocab = { "<STOP>" }
+	local word_to_id = { ["<STOP>"] = 1 }
+	local count = 1
+	for word in string.gmatch(cleaned, PATTERN_WORDS) do
+		if not unique_words[word] then
+			unique_words[word] = true
+			count = count + 1
+			vocab[count] = word
+			word_to_id[word] = count
+		end
+	end
+
+	Config.Vocab = vocab
+	Config.WordToID = word_to_id
+
+	-- [POPRAWKA GPT-2]: Sprawdzamy zgodność z wymiarem 32 dla nowej sieci
+	local already_trained = Config.EmbeddingTable and
+		Config.EmbeddingTable[1] and
+		#Config.EmbeddingTable[1] == 32
+
+	-- W miejsce starego "already_trained" bloku:
+	if not Config.EmbeddingTable then Config.EmbeddingTable = {} end
+	if not Config.LM_Head then Config.LM_Head = { weights = {}, biases = {} } end
+
+	local emb = Config.EmbeddingTable
+	local lm_w = Config.LM_Head.weights
+	local lm_b = Config.LM_Head.biases
+	local rand = math.random
+	local init_scale = 0.1767766 -- 1 / sqrt(32)
+
+	local added = 0
+	for i = 1, count do
+		if not emb[i] or #emb[i] ~= 32 then
+			local e, w = {}, {}
+			for d = 1, 32 do
+				e[d] = (rand() - 0.5) * init_scale
+				w[d] = (rand() - 0.5) * init_scale
+			end
+			emb[i] = e
+			lm_w[i] = w
+			lm_b[i] = lm_b[i] or 0.0
+			added = added + 1
+		end
+	end
+	print("[Tokenizer] Nowe embeddingi/LM_Head zainicjalizowane dla " .. added .. " słów (z " .. count .. " w słowniku)")
+
+end
+
+function Tokenizer.GetEmbedding(token_id)
+	local original = Config.EmbeddingTable[token_id]
+	if original then
+		return table.clone(original)
+	end
+	return table.clone(ZERO_VECTOR) -- Klonujemy cache 32-elementowy
+end
+
+function Tokenizer.Encode(text)
+	local cleaned = Tokenizer.CleanText(text)
+	local tokens = {}
+	local count = 0
+	local word_to_id = Config.WordToID -- Lokalna referencja, szybszy dostęp
+	for word in string.gmatch(cleaned, PATTERN_WORDS) do
+		local id = word_to_id[word]
+		if id then
+			count = count + 1
+			tokens[count] = id
+		end
+	end
+	return tokens
+end
+
+function Tokenizer.Decode(token_ids)
+	local vocab = Config.Vocab -- Lokalna referencja
+	local final_sentence = {}
+	local count = 0
+	for _, id in ipairs(token_ids) do
+		local word = vocab[id]
+		if word then
+			count = count + 1
+			final_sentence[count] = word
+		end
+	end
+	local output = table.concat(final_sentence, " ")
+	return string.gsub(output, " %.", ".")
+end
+
+return Tokenizer
