@@ -1,0 +1,377 @@
+local Trainer = {}
+
+-- ============================================================
+--  MODUŁY
+-- ============================================================
+local Config      = require(script.Parent.data)
+local Transformer = require(script.Parent.Transformer)
+
+-- ============================================================
+--  STAŁE
+-- ============================================================
+local D           = 16
+local CONTEXT_LEN = 7
+
+local LR_HEAD_MULT = 1.0
+local LR_EMB_MULT  = 0.5
+local LR_ATT_MULT  = 0.05
+local LR_FFN_MULT  = 0.05 -- Mocne tłumienie dla FFN żeby nie skakało
+
+local GRAD_CLIP  = 0.05
+local WEIGHT_MAX = 3.0
+
+-- math cache — unikamy lookup globals w hot loop
+local m_exp   = math.exp
+local m_clamp = math.clamp
+local m_log   = math.log
+local m_cos   = math.cos
+local m_sqrt  = math.sqrt
+local m_pi    = math.pi
+local m_huge  = math.huge
+local m_max   = math.max
+local m_floor = math.floor
+
+-- ============================================================
+--  SOFTMAX (zero alokacji)
+-- ============================================================
+local function softmax(logits, out, n)
+	local max_v = -m_huge
+	for i = 1, n do
+		local v = logits[i]
+		if v > max_v then max_v = v end
+	end
+	if max_v ~= max_v then max_v = 0 end
+
+	local sum = 0
+	for i = 1, n do
+		local ev = m_exp(m_clamp(logits[i] - max_v, -20, 20))
+		out[i] = ev
+		sum    = sum + ev
+	end
+	if sum < 1e-9 then sum = 1e-9 end
+	local inv = 1 / sum
+	for i = 1, n do out[i] = out[i] * inv end
+end
+
+-- ============================================================
+--  FORWARD PASS
+-- ============================================================
+local function forwardPass(context_tokens, target_token, seq_buf, logits_buf, probs_buf, vocab_size)
+
+	local ctx_size   = #context_tokens
+	local lm_weights = Config.LM_Head.weights
+	local lm_biases  = Config.LM_Head.biases
+	local emb_table  = Config.EmbeddingTable
+
+	for i = 1, ctx_size do
+		local emb = emb_table[context_tokens[i]]
+		local e   = seq_buf[i]
+		if emb then
+			for d = 1, D do e[d] = emb[d] end
+		else
+			for d = 1, D do e[d] = 0.0 end
+		end
+	end
+
+	local context_vectors = Transformer.ExecuteAttention(seq_buf, ctx_size)
+	local last_vector     = context_vectors[ctx_size]
+	if not last_vector then
+		local s = seq_buf[1]
+		for d = 1, D do s[d] = 0.0 end
+		last_vector = s
+	end
+
+	-- Logity z ręcznym unrollem D=16
+	local lv = last_vector
+	for w_id = 1, vocab_size do
+		local w = lm_weights[w_id]
+		local s = lm_biases[w_id] or 0.0
+		if w then
+			s = s + lv[1]*w[1]    + lv[2]*w[2]    + lv[3]*w[3]    + lv[4]*w[4]
+				+ lv[5]*w[5]    + lv[6]*w[6]    + lv[7]*w[7]    + lv[8]*w[8]
+				+ lv[9]*w[9]    + lv[10]*w[10] + lv[11]*w[11] + lv[12]*w[12]
+				+ lv[13]*w[13] + lv[14]*w[14] + lv[15]*w[15] + lv[16]*w[16]
+		end
+		logits_buf[w_id] = s
+	end
+
+	softmax(logits_buf, probs_buf, vocab_size)
+
+	local tp = probs_buf[target_token] or 0
+	if tp < 1e-15 then tp = 1e-15 end
+	return -m_log(tp), last_vector
+end
+
+-- ============================================================
+--  INICJALIZACJA WAG
+-- ============================================================
+local function initWeights(rng)
+	print("[Trainer] Inicjalizacja wag D=" .. D .. "...")
+
+	local vocab_size = #Config.Vocab
+	local emb_limit  = m_sqrt(1 / D)
+	local lm_limit   = m_sqrt(6 / (D + vocab_size))
+	local att_limit  = m_sqrt(3 / D)
+	local he1        = m_sqrt(2 / D)
+	local he2        = m_sqrt(2 / 32)
+
+	local emb  = table.create(vocab_size)
+	local lm_w = table.create(vocab_size)
+	local lm_b = table.create(vocab_size, 0.0)
+
+	for w_id = 1, vocab_size do
+		local e = table.create(D)
+		local w = table.create(D)
+		for d = 1, D do
+			e[d] = rng:NextNumber(-emb_limit, emb_limit)
+			w[d] = rng:NextNumber(-lm_limit,  lm_limit)
+		end
+		emb[w_id]  = e
+		lm_w[w_id] = w
+	end
+
+	Config.EmbeddingTable = emb
+	Config.LM_Head        = { weights = lm_w, biases = lm_b }
+
+	-- Attention — ZAWSZE resetuj
+	if not Config.warstwyy then Config.warstwyy = 1 end
+	if not Config.warstwy then
+		Config.warstwy = {}
+		for i = 1, Config.warstwyy do
+			Config.warstwy["v" .. i] = {}
+		end
+	end
+
+	for _, warstwa in pairs(Config.warstwy) do
+		warstwa.Wq = table.create(D)
+		warstwa.Wk = table.create(D)
+		warstwa.Wv = table.create(D)
+		warstwa.Wo = table.create(D)
+		for d = 1, D do
+			warstwa.Wq[d] = rng:NextNumber(-att_limit, att_limit)
+			warstwa.Wk[d] = rng:NextNumber(-att_limit, att_limit)
+			warstwa.Wv[d] = rng:NextNumber(-att_limit, att_limit)
+			warstwa.Wo[d] = rng:NextNumber(-att_limit, att_limit)
+		end
+		warstwa.Bq = 0.0
+		warstwa.Bk = 0.0
+		warstwa.Bv = 0.0
+		warstwa.Bo = 0.0
+	end
+
+	-- FFN — ZAWSZE resetuj
+	if not Config.FeedForward then
+		Config.FeedForward = {
+			{ weights = {}, biases = {} },
+			{ weights = {}, biases = {} },
+		}
+	end
+
+	for i = 1, 32 do
+		local row = table.create(D)
+		for j = 1, D do row[j] = rng:NextNumber(-he1, he1) end
+		Config.FeedForward[1].weights[i] = row
+		Config.FeedForward[1].biases[i]  = rng:NextNumber(-0.01, 0.01)
+	end
+	for i = 1, D do
+		local row = table.create(32)
+		for j = 1, 32 do row[j] = rng:NextNumber(-he2, he2) end
+		Config.FeedForward[2].weights[i] = row
+		Config.FeedForward[2].biases[i]  = rng:NextNumber(-0.01, 0.01)
+	end
+end
+
+-- ============================================================
+--  BACKPROP (STABILNY)
+-- ============================================================
+local function backprop(context_tokens, probs_buf, last_vector, target_token, lr, d_vector_buf, vocab_size)
+
+	local lm_weights = Config.LM_Head.weights
+	local lm_biases  = Config.LM_Head.biases
+	local ctx_size   = #context_tokens
+
+	local lr_head   = lr * LR_HEAD_MULT
+	local lr_emb    = lr * LR_EMB_MULT * (1 / ctx_size)
+	local lr_att    = lr * LR_ATT_MULT
+	local lr_ffn    = lr * LR_FFN_MULT
+	local inv_vocab = 1 / vocab_size
+
+	local lv = last_vector
+	local dv = d_vector_buf
+
+	-- Zeruj gradient
+	dv[1]=0 dv[2]=0 dv[3]=0 dv[4]=0
+	dv[5]=0 dv[6]=0 dv[7]=0 dv[8]=0
+	dv[9]=0 dv[10]=0 dv[11]=0 dv[12]=0
+	dv[13]=0 dv[14]=0 dv[15]=0 dv[16]=0
+
+	-- 1. LM Head
+	for w_id = 1, vocab_size do
+		local prob    = probs_buf[w_id]
+		local d_logit = (w_id == target_token) and (prob - 1.0) or prob
+
+		local b_step = m_clamp(lr_head * d_logit, -GRAD_CLIP, GRAD_CLIP)
+		lm_biases[w_id] = m_clamp(lm_biases[w_id] - b_step, -WEIGHT_MAX, WEIGHT_MAX)
+
+		local w = lm_weights[w_id]
+		if w then
+			local dl_iv  = d_logit * inv_vocab
+			local dl_lrh = lr_head * d_logit
+
+			dv[1]  = dv[1]  + dl_iv * w[1]
+			dv[2]  = dv[2]  + dl_iv * w[2]
+			dv[3]  = dv[3]  + dl_iv * w[3]
+			dv[4]  = dv[4]  + dl_iv * w[4]
+			dv[5]  = dv[5]  + dl_iv * w[5]
+			dv[6]  = dv[6]  + dl_iv * w[6]
+			dv[7]  = dv[7]  + dl_iv * w[7]
+			dv[8]  = dv[8]  + dl_iv * w[8]
+			dv[9]  = dv[9]  + dl_iv * w[9]
+			dv[10] = dv[10] + dl_iv * w[10]
+			dv[11] = dv[11] + dl_iv * w[11]
+			dv[12] = dv[12] + dl_iv * w[12]
+			dv[13] = dv[13] + dl_iv * w[13]
+			dv[14] = dv[14] + dl_iv * w[14]
+			dv[15] = dv[15] + dl_iv * w[15]
+			dv[16] = dv[16] + dl_iv * w[16]
+
+			w[1]  = m_clamp(w[1]  - m_clamp(dl_lrh*lv[1],  -GRAD_CLIP,GRAD_CLIP), -WEIGHT_MAX,WEIGHT_MAX)
+			w[2]  = m_clamp(w[2]  - m_clamp(dl_lrh*lv[2],  -GRAD_CLIP,GRAD_CLIP), -WEIGHT_MAX,WEIGHT_MAX)
+			w[3]  = m_clamp(w[3]  - m_clamp(dl_lrh*lv[3],  -GRAD_CLIP,GRAD_CLIP), -WEIGHT_MAX,WEIGHT_MAX)
+			w[4]  = m_clamp(w[4]  - m_clamp(dl_lrh*lv[4],  -GRAD_CLIP,GRAD_CLIP), -WEIGHT_MAX,WEIGHT_MAX)
+			w[5]  = m_clamp(w[5]  - m_clamp(dl_lrh*lv[5],  -GRAD_CLIP,GRAD_CLIP), -WEIGHT_MAX,WEIGHT_MAX)
+			w[6]  = m_clamp(w[6]  - m_clamp(dl_lrh*lv[6],  -GRAD_CLIP,GRAD_CLIP), -WEIGHT_MAX,WEIGHT_MAX)
+			w[7]  = m_clamp(w[7]  - m_clamp(dl_lrh*lv[7],  -GRAD_CLIP,GRAD_CLIP), -WEIGHT_MAX,WEIGHT_MAX)
+			w[8]  = m_clamp(w[8]  - m_clamp(dl_lrh*lv[8],  -GRAD_CLIP,GRAD_CLIP), -WEIGHT_MAX,WEIGHT_MAX)
+			w[9]  = m_clamp(w[9]  - m_clamp(dl_lrh*lv[9],  -GRAD_CLIP,GRAD_CLIP), -WEIGHT_MAX,WEIGHT_MAX)
+			w[10] = m_clamp(w[10] - m_clamp(dl_lrh*lv[10], -GRAD_CLIP,GRAD_CLIP), -WEIGHT_MAX,WEIGHT_MAX)
+			w[11] = m_clamp(w[11] - m_clamp(dl_lrh*lv[11], -GRAD_CLIP,GRAD_CLIP), -WEIGHT_MAX,WEIGHT_MAX)
+			w[12] = m_clamp(w[12] - m_clamp(dl_lrh*lv[12], -GRAD_CLIP,GRAD_CLIP), -WEIGHT_MAX,WEIGHT_MAX)
+			w[13] = m_clamp(w[13] - m_clamp(dl_lrh*lv[13], -GRAD_CLIP,GRAD_CLIP), -WEIGHT_MAX,WEIGHT_MAX)
+			w[14] = m_clamp(w[14] - m_clamp(dl_lrh*lv[14], -GRAD_CLIP,GRAD_CLIP), -WEIGHT_MAX,WEIGHT_MAX)
+			w[15] = m_clamp(w[15] - m_clamp(dl_lrh*lv[15], -GRAD_CLIP,GRAD_CLIP), -WEIGHT_MAX,WEIGHT_MAX)
+			w[16] = m_clamp(w[16] - m_clamp(dl_lrh*lv[16], -GRAD_CLIP,GRAD_CLIP), -WEIGHT_MAX,WEIGHT_MAX)
+		end
+	end
+
+	-- 2. Stabilne FFN (zabezpieczone przed wybuchem gradientu)
+	local ffn = Config.FeedForward
+	if ffn and ffn[1] and ffn[2] then
+		for d = 1, D do
+			local grad_out = m_clamp(lr_ffn * dv[d], -0.005, 0.005)
+			ffn[2].biases[d] = m_clamp(ffn[2].biases[d] - grad_out, -WEIGHT_MAX, WEIGHT_MAX)
+			local w_row = ffn[2].weights[d]
+			for h = 1, 32 do
+				w_row[h] = m_clamp(w_row[h] - grad_out, -WEIGHT_MAX, WEIGHT_MAX)
+			end
+		end
+
+		for h = 1, 32 do
+			local grad_hidden = m_clamp(lr_ffn * 0.1, -0.005, 0.005)
+			ffn[1].biases[h] = m_clamp(ffn[1].biases[h] - grad_hidden, -WEIGHT_MAX, WEIGHT_MAX)
+			local w_row = ffn[1].weights[h]
+			for d = 1, D do
+				w_row[d] = m_clamp(w_row[d] - grad_hidden, -WEIGHT_MAX, WEIGHT_MAX)
+			end
+		end
+	end
+
+	-- 3. Embeddingi
+	local emb_table = Config.EmbeddingTable
+	for tc = 1, ctx_size do
+		local emb = emb_table[context_tokens[tc]]
+		if emb then
+			for d = 1, D do
+				local step = m_clamp(lr_emb * dv[d], -GRAD_CLIP, GRAD_CLIP)
+				emb[d] = m_clamp(emb[d] - step, -WEIGHT_MAX, WEIGHT_MAX)
+			end
+		end
+	end
+
+	-- 4. Attention
+	for _, warstwa in pairs(Config.warstwy) do
+		local Wq = warstwa.Wq
+		local Wk = warstwa.Wk
+		local Wv = warstwa.Wv
+		local Wo = warstwa.Wo
+		for d = 1, D do
+			local g = m_clamp(lr_att * dv[d], -GRAD_CLIP, GRAD_CLIP)
+			Wq[d] = m_clamp(Wq[d] - g, -WEIGHT_MAX, WEIGHT_MAX)
+			Wk[d] = m_clamp(Wk[d] - g, -WEIGHT_MAX, WEIGHT_MAX)
+			Wv[d] = m_clamp(Wv[d] - g, -WEIGHT_MAX, WEIGHT_MAX)
+			Wo[d] = m_clamp(Wo[d] - g, -WEIGHT_MAX, WEIGHT_MAX)
+		end
+	end
+end
+
+-- ============================================================
+--  GŁÓWNA FUNKCJA TRENINGU
+-- ============================================================
+function Trainer.Train(sentences_batch, epochs, learning_rate)
+
+	initWeights(Random.new(42))
+
+	local vocab_size = #Config.Vocab
+	local log_every  = m_max(1, m_floor(epochs / 10))
+	local WAIT_EVERY = 2
+
+	local seq_buf = {}
+	for i = 1, CONTEXT_LEN do
+		seq_buf[i] = table.create(D, 0.0)
+	end
+	local logits_buf   = table.create(vocab_size, 0.0)
+	local probs_buf    = table.create(vocab_size, 0.0)
+	local d_vector_buf = table.create(D, 0.0)
+	local ctx_buf      = table.create(CONTEXT_LEN, 0)
+
+	print(string.format("[Trainer] Start | vocab=%d | D=%d | epochs=%d | lr=%.4f", vocab_size, D, epochs, learning_rate))
+
+	for epoch = 1, epochs do
+		local progress = (epoch - 1) / m_max(epochs - 1, 1)
+		local lr       = learning_rate * (0.5 * (1 + m_cos(m_pi * progress)))
+
+		local total_loss  = 0
+		local valid_steps = 0
+
+		for _, token_ids in ipairs(sentences_batch) do
+			local tlen = #token_ids
+			if tlen >= 2 then
+				for i = 2, tlen do
+					local start_idx = m_max(1, i - CONTEXT_LEN)
+					local c = 0
+					for j = start_idx, i - 1 do
+						c = c + 1
+						ctx_buf[c] = token_ids[j]
+					end
+					for j = c + 1, CONTEXT_LEN do ctx_buf[j] = nil end
+
+					local target_token      = token_ids[i]
+					local loss, last_vector = forwardPass(ctx_buf, target_token, seq_buf, logits_buf, probs_buf, vocab_size)
+
+					if loss == loss and loss < m_huge then
+						total_loss  = total_loss + loss
+						valid_steps = valid_steps + 1
+					end
+
+					backprop(ctx_buf, probs_buf, last_vector, target_token, lr, d_vector_buf, vocab_size)
+				end
+			end
+		end
+
+		if epoch == 1 or epoch % log_every == 0 then
+			local avg = valid_steps > 0 and (total_loss / valid_steps) or 0
+			local fr = script.Frame:Clone()
+			fr.d.Text = string.format("[Trainer] E: %d/%d | Loss: %.4f | LR: %.5f", epoch, epochs, avg, lr)
+			fr.Parent = script.Parent.Parent.Frame.Chats["1"].ScrollingFrame
+		end
+
+		if epoch % WAIT_EVERY == 0 then
+			task.wait()
+		end
+	end
+
+	print("[Trainer] Training Success!")
+	Config.exportConfigToOutput()
+end
+
+return Trainer
