@@ -1,0 +1,56 @@
+local Config = {
+
+	Dimension = 32,
+	Temperature = 0.70,
+
+	Model = {
+		Layers = 4,
+		Heads = 2,
+		ContextSize = 64,
+		FFNSize = 96,
+	},
+
+	Tokenizer = {
+		Mode = "Subword",
+	},
+
+	Training = {
+		Mode = "MultiStage",
+
+		ShuffleData = true,
+		Epochs = 300,
+
+		LearningRate = 0.002,
+		
+
+		YieldInterval = 0.2,
+	},
+
+	Stages = {
+		{
+			Name = "Language",
+			Enabled = true,
+			Epochs = 80,
+		},
+
+		{
+			Name = "Assistant",
+			Enabled = true,
+			Epochs = 500,
+		},
+	},
+
+	PositionalEncoding = {
+		Enabled = true,
+		Added = 0,
+		Multi = 1,
+	},
+
+	Dropout = {
+		Enabled = false,
+		Rate = 0.02,
+	},
+
+}
+
+return Config
