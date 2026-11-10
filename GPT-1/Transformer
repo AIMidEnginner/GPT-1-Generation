@@ -1,0 +1,309 @@
+local Transformer = {}
+
+--[[
+    __  _____  ____  __________            __  ___________    ____ 
+   /  |/  / / / / / /_  __/  _/           / / / / ____/   |  / __ \
+  / /|_/ / / / / /   / /  / /   ______   / /_/ / __/ / /| | / / / /
+ / /  / / /_/ / /___/ / _/ /   /_____/  / __  / /___/ ___ |/ /_/ / 
+/_/  /_/\____/_____/_/ /___/           /_/ /_/_____/_/  |_/_____/  
+                                                                   
+-------------------------------------------------------------------                                                                             
+         ___  ___________________   ________________  _   __
+        /   |/_  __/_  __/ ____/ | / /_  __/  _/ __ \/ | / /
+       / /| | / /   / / / __/ /  |/ / / /  / // / / /  |/ / 
+      / ___ |/ /   / / / /___/ /|  / / / _/ // /_/ / /|  /  
+     /_/  |_/_/   /_/ /_____/_/ |_/ /_/ /___/\____/_/ |_/   
+                                                                                                            
+
+-- ]]
+-- ============================================================
+--  MODS
+-- ============================================================
+local Config = require(script.Parent.data)
+
+-- ============================================================
+--  SAV
+-- ============================================================
+local D        = 16
+local CLAMP_EXP = 20  
+
+-- ============================================================
+--  FEED FORWARD
+-- ============================================================
+local function layerNormInPlace(X, gamma, beta)
+	local N = #X -- Liczba tokenów
+	local eps = 1e-5
+
+	for i = 1, N do
+		local xi = X[i]
+
+		-- 1. Oblicz średnią (Mean) dla tego tokenu
+		local sum = 0
+		for d = 1, D do sum = sum + xi[d] end
+		local mean = sum / D
+
+		-- 2. Oblicz wariancję (Variance)
+		local variance_sum = 0
+		for d = 1, D do
+			local diff = xi[d] - mean
+			variance_sum = variance_sum + diff * diff
+		end
+		local variance = variance_sum / D
+		local rsqrt = 1 / math.sqrt(variance + eps) -- Odwrotność pierwiastka dla szybkości
+
+		-- 3. Normalizacja + aplikacja Gamma i Beta (In-place - nadpisujemy xi)
+		for d = 1, D do
+			local g = (gamma and gamma[d]) or 1.0
+			local b = (beta and beta[d]) or 0.0
+			xi[d] = ((xi[d] - mean) * rsqrt) * g + b
+		end
+	end
+end
+
+local function feedForward(X, network_config)
+	local current = X
+	-- Jeśli nie podasz configu warstwy, bierze globalny (awaryjnie)
+	local network = network_config or Config.FeedForward 
+
+	for l = 1, #network do
+		local layer   = network[l]
+		local weights = layer.weights
+		local biases  = layer.biases
+		local out_size = #biases
+		local in_size  = #current
+		local next    = table.create(out_size, 0.0)
+
+		for i = 1, out_size do
+			local w       = weights[i]
+			local sum     = biases[i] or 0.0
+			for j = 1, in_size do
+				sum = sum + w[j] * current[j]
+			end
+
+			-- [POPRAWKA]: Aktywacja tylko dla ukrytych warstw. 
+			-- Ostatnia warstwa zwraca surowy wynik (liniowy)
+			if l < #network then
+				next[i] = math.max(0, sum)  -- ReLU
+			else
+				next[i] = sum               -- Brak aktywacji na końcu!
+			end
+		end
+
+		current = next
+	end
+
+	return current
+end
+
+-- ============================================================
+--  SELF-ATTENTION  
+-- ============================================================
+local function selfAttention(X, layer_idx)
+	local layer = Config.warstwy["v" .. layer_idx]
+	local N     = #X
+	local Wq, Wk, Wv, Wo = layer.Wq, layer.Wk, layer.Wv, layer.Wo
+	local Bq, Bk, Bv, Bo = layer.Bq, layer.Bk, layer.Bv, layer.Bo
+	local scale = 1 / math.sqrt(D)  
+
+	-- [BEZPIECZNIK]: Sprawdzamy, czy pierwszy element to tabela (Macierz 2D), czy liczba (Wektor 1D)
+	local is2D = (type(Wq) == "table" and type(Wq[1]) == "table")
+
+	-- ── Projekcje Q, K, V ─────────────────────────────────
+	local Q = table.create(N)
+	local K = table.create(N)
+	local V = table.create(N)
+
+	for i = 1, N do
+		local xi  = X[i]
+		local q   = table.create(D, 0.0)
+		local k   = table.create(D, 0.0)
+		local v   = table.create(D, 0.0)
+
+		if is2D then
+			-- NOWA MATMA (Dla GPT-2 - Pełne mnożenie macierzy)
+			for d = 1, D do
+				local sumQ = (type(Bq) == "table" and Bq[d]) or 0.0
+				local sumK = (type(Bk) == "table" and Bk[d]) or 0.0
+				local sumV = (type(Bv) == "table" and Bv[d]) or 0.0
+
+				for j = 1, D do
+					sumQ = sumQ + xi[j] * Wq[j][d]
+					sumK = sumK + xi[j] * Wk[j][d]
+					sumV = sumV + xi[j] * Wv[j][d]
+				end
+				q[d] = sumQ
+				k[d] = sumK
+				v[d] = sumV
+			end
+		else
+			-- STARA MATMA (Kompatybilność z GPT-1 - Mnożenie wektorowe)
+			for d = 1, D do
+				q[d] = xi[d] * (Wq[d] or 1.0) + (type(Bq) == "number" and Bq or 0.0)
+				k[d] = xi[d] * (Wk[d] or 1.0) + (type(Bk) == "number" and Bk or 0.0)
+				v[d] = xi[d] * (Wv[d] or 1.0) + (type(Bv) == "number" and Bv or 0.0)
+			end
+		end
+
+		Q[i] = q
+		K[i] = k
+		V[i] = v
+	end
+
+	-- ── Attention scores (causal / masked) ────────────────
+	local scores = table.create(N)
+
+	for i = 1, N do
+		local qi      = Q[i]
+		local row      = table.create(N, 0.0)
+		local exp_sum = 0
+
+		for j = 1, i do 
+			local dot = 0
+			local kj  = K[j]
+			for d = 1, D do dot = dot + qi[d] * kj[d] end
+			local e    = math.exp(math.clamp(dot * scale, -CLAMP_EXP, CLAMP_EXP))
+			row[j]     = e
+			exp_sum    = exp_sum + e
+		end
+
+		if exp_sum < 1e-9 then exp_sum = 1e-9 end
+		for j = 1, i do row[j] = row[j] / exp_sum end
+
+		scores[i] = row
+	end
+
+	-- ── Weighted sum → Z ──────────────────────────────────
+	local Z = table.create(N)
+	local isWo2D = (type(Wo) == "table" and type(Wo[1]) == "table")
+
+	for i = 1, N do
+		local si  = scores[i]
+
+		-- Najpierw zbieramy wartości z V
+		local context = table.create(D, 0.0)
+		for d = 1, D do
+			local ws = 0
+			for j = 1, i do ws = ws + si[j] * V[j][d] end
+			context[d] = ws
+		end
+
+		-- Projekcja wyjściowa Wo
+		local z = table.create(D, 0.0)
+		if isWo2D then
+			-- Nowy format (Macierz Wo)
+			for d = 1, D do
+				local sumO = (type(Bo) == "table" and Bo[d]) or 0.0
+				for j = 1, D do
+					sumO = sumO + context[j] * Wo[j][d]
+				end
+				z[d] = sumO
+			end
+		else
+			-- Stary format (Wektor Wo)
+			for d = 1, D do
+				z[d] = context[d] * (Wo[d] or 1.0) + (type(Bo) == "number" and Bo or 0.0)
+			end
+		end
+		Z[i] = z
+	end
+
+	return Z
+end
+
+-- ============================================================
+--  EXECUTE ATTENTION  + RESIDUAL
+-- ============================================================
+function Transformer.ExecuteAttention(X)
+	local seq = table.create(#X)
+	for i = 1, #X do seq[i] = table.clone(X[i]) end
+
+	local num_layers = Config.num_layers or 1 
+
+	for layer_idx = 1, num_layers do
+		local layer = Config.warstwy["v" .. layer_idx]
+
+		-- 1. Najpierw Attention na surowym seq
+		local attn_out = selfAttention(seq, layer_idx)
+
+		-- 2. Residual Attention: seq = seq + attn_out
+		for row = 1, #seq do
+			local s = seq[row]
+			local a = attn_out[row]
+			for d = 1, D do
+				s[d] = s[d] + a[d]
+			end
+		end
+
+		-- 3. [POST-LN] Normalizacja po bloku Attention
+		layerNormInPlace(seq, layer.LN1_gamma, layer.LN1_beta)
+
+		-- 4. Feed-Forward na przetworzonym seq
+		-- Tworzymy tymczasową tabelę na wyjścia z FFN dla całego seq
+		local ffn_outputs = table.create(#seq)
+		for row = 1, #seq do
+			ffn_outputs[row] = feedForward(seq[row], layer.FeedForward)
+		end
+
+		-- 5. Residual FFN: seq = seq + ffn_outputs
+		for row = 1, #seq do
+			local s = seq[row]
+			local ff = ffn_outputs[row]
+			for d = 1, D do
+				s[d] = s[d] + ff[d] -- Bez mnożenia przez 0.1!
+			end
+		end
+
+		-- 6. [POST-LN] Normalizacja po bloku FFN
+		layerNormInPlace(seq, layer.LN2_gamma, layer.LN2_beta)
+	end
+
+	return seq
+end
+
+-- ============================================================
+--  LM HEAD  
+-- ============================================================
+function Transformer.LM_Head(logits)
+	local lm         = Config.LM_Head
+	local lm_weights = lm.weights
+	local lm_biases  = lm.biases
+	local vocab_size = #Config.Vocab
+	local outputs    = table.create(vocab_size, 0.0)
+	local max_val    = -math.huge
+
+	for w = 1, vocab_size do
+		local ww  = lm_weights[w]
+		local val = lm_biases[w] or 0
+		if ww then
+			for d = 1, #logits do val = val + ww[d] * logits[d] end
+		end
+		outputs[w] = val
+		if val > max_val then max_val = val end
+	end
+
+	-- Softmax
+	local sum = 0
+	for w = 1, vocab_size do
+		local e    = math.exp(math.clamp(outputs[w] - max_val, -CLAMP_EXP, CLAMP_EXP))
+		outputs[w] = e
+		sum        = sum + e
+	end
+	if sum < 1e-9 then sum = 1e-9 end
+	for w = 1, vocab_size do outputs[w] = outputs[w] / sum end
+
+	return outputs
+end
+
+-- ============================================================
+--  FORWARD 
+-- ============================================================
+function Transformer.Forward(SequenceMatrix)
+	local seq = table.create(#SequenceMatrix)
+	for i = 1, #SequenceMatrix do seq[i] = table.clone(SequenceMatrix[i]) end
+
+	local latent = Transformer.ExecuteAttention(seq)
+
+	return latent
+end
+
+return Transformer
