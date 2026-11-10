@@ -1,7 +1,4 @@
 local a = [[
-	text
-	GPT-2
-
 	Model: Decoder-Only Transformer
 
 	──────────────────────────────
@@ -31,14 +28,13 @@ local a = [[
 	CEL MODELU
 	──────────────────────────────
 
-	GPT-2 rozwija architekturę GPT-1 i jest pierwszą w pełni funkcjonalną wersją modelu.
+	GPT-1Pro rozwija architekturę GPT-1 i jest pierwszą w pełni funkcjonalną wersją modelu.
 
 	Główne cele projektu:
 
 	• poprawna implementacja Multi-Head Attention,
 	• stworzenie kompletnego Decoder-Only Transformera,
 	• zwiększenie możliwości rozumienia kontekstu,
-	• przygotowanie solidnej podstawy pod kolejne wersje (GPT-3 i następne).
 
 	Model stanowi pierwszy kompletny etap rozwoju własnej architektury GPT.
 
