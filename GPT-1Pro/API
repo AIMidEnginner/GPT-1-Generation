@@ -1,0 +1,22 @@
+local module = {}
+
+
+local Tokenizer = require(script.Parent.Tokenizer)
+local Decoder = require(script.Parent.Decoder)
+
+-- Domyślna ilość kroków, jeśli użytkownik nie poda własnej
+local DEFAULT_STEPS = 10
+
+function module.API(prompt, max_steps)
+	-- Sprawdzenie poprawności argumentów
+	local steps = max_steps or DEFAULT_STEPS
+	if not prompt or prompt == "" then 
+		return "Błąd: Prompt nie może być pusty!" 
+	end
+
+	-- Wywołanie dekodera i zwrot gotowego tekstu
+	local generated_text = Decoder.Decoder(prompt, steps)
+	return generated_text
+end
+
+return module
