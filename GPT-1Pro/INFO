@@ -1,0 +1,46 @@
+local a = [[
+	text
+	GPT-2
+
+	Model: Decoder-Only Transformer
+
+	──────────────────────────────
+	SPECYFIKACJA
+	──────────────────────────────
+
+	• Architektura: Decoder-Only
+	• Transformer Blocks: 15
+	• Multi-Head Attention: ✔
+	• Attention Heads: 4
+	• Feed Forward Network:
+	    32 → 64 → 32
+	• Hidden Dimension: 16
+	• Context Length: 10 tokenów
+
+	──────────────────────────────
+	NOWOŚCI
+	──────────────────────────────
+
+	✔ W pełni działający Multi-Head Attention.
+
+	Każda głowa posiadaa własną logikę Self-Attention, a ich wyniki są łączone i przekazywane do kolejnych etapów Transformera.
+
+	Dodano pełny blok Transformera z połączeniami rezydualnymi (Residual Connections) oraz normalizacją warstw (Layer Normalization), jeśli zostały zaimplementowane.
+
+	──────────────────────────────
+	CEL MODELU
+	──────────────────────────────
+
+	GPT-2 rozwija architekturę GPT-1 i jest pierwszą w pełni funkcjonalną wersją modelu.
+
+	Główne cele projektu:
+
+	• poprawna implementacja Multi-Head Attention,
+	• stworzenie kompletnego Decoder-Only Transformera,
+	• zwiększenie możliwości rozumienia kontekstu,
+	• przygotowanie solidnej podstawy pod kolejne wersje (GPT-3 i następne).
+
+	Model stanowi pierwszy kompletny etap rozwoju własnej architektury GPT.
+
+
+]]
