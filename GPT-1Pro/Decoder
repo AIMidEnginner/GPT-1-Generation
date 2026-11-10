@@ -1,0 +1,169 @@
+local module = {}
+
+local MHA = require(script.Parent.TransformerBlock)
+local Tokenizer = require(script.Parent.Tokenizer)
+local Config = require(script.Parent.Data)
+
+local math_huge = math.huge
+local math_exp = math.exp
+
+-------------------------------------------------------------------
+-- INICJALIZACJA POSITIONAL EMBEDDINGS (D = 32)
+-------------------------------------------------------------------
+local max_pos = Config.Context_Length or 128
+
+if not Config.PositionalEmbedding then
+	Config.PositionalEmbedding = {}
+	local rand = math.random
+	local init_scale = 0.1767766--1 / math.sqrt(Config.D)
+
+	for i = 1, max_pos do
+		local pos_vec = table.create(Config.D, 0.0)
+		for d = 1, Config.D do
+			pos_vec[d] = (rand() - 0.5) * init_scale
+		end
+		Config.PositionalEmbedding[i] = pos_vec
+	end
+end
+
+-------------------------------------------------------------------
+-- METODY POMOCNICZE
+-------------------------------------------------------------------
+local function zeroVector()
+	return table.create(Config.D, 0.0)
+end
+
+local function getEmbedding(token_id)
+	local emb = Config.EmbeddingTable[token_id]
+	if not emb then return zeroVector() end
+	return table.clone(emb)
+end
+
+-- Zoptymalizowany Softmax uwzględniający temperaturę (In-place)
+local function SoftmaxWithTemperature(logits, temperature)
+	local size = #logits
+	local max_val = -math_huge
+
+	for i = 1, size do
+		if logits[i] > max_val then max_val = logits[i] end
+	end
+
+	local sum = 0.0
+	for i = 1, size do
+		local e = math_exp((logits[i] - max_val) / temperature)
+		logits[i] = e
+		sum = sum + e
+	end
+
+	if sum < 1e-9 then sum = 1e-9 end
+	local inv_sum = 1.0 / sum
+
+	for i = 1, size do
+		logits[i] = logits[i] * inv_sum
+	end
+end
+
+-- Losowanie tokenu na podstawie tablicy prawdopodobieństw (Skumulowana suma)
+local function SampleFromProbabilities(probabilities)
+	local r = math.random()
+	local cumulative = 0.0
+
+	for id = 1, #probabilities do
+		cumulative = cumulative + probabilities[id]
+		if r <= cumulative then
+			return id
+		end
+	end
+
+	return 1
+end
+
+-------------------------------------------------------------------
+-- GŁÓWNA FUNKCJA DEKODERA Z TEMPERATURĄ
+-------------------------------------------------------------------
+function module.Decoder(prompt, max_steps)
+	local temperature = Config.Temperature or 1.0
+	if temperature < 0.01 then temperature = 0.01 end
+
+	local generated_tokens = Tokenizer.Encode(prompt)
+	if #generated_tokens == 0 then 
+		generated_tokens = {math.random(3, #Config.Vocab)} -- Losuje pies/kot/mleko/woda na start
+	end
+
+	local context_limit = Config.Context_Length or 128
+	local stop_token_id = Config.WordToID["<STOP>"] or 1
+
+	local logits_buffer = table.create(#Config.Vocab, 0.0)
+
+	for step = 1, max_steps do
+		task.wait()
+		local current_seq_len = #generated_tokens
+
+		local start_idx = 1
+		if current_seq_len > context_limit then
+			start_idx = current_seq_len - context_limit + 1
+		end
+
+		-- 1. Przygotowanie macierzy wejściowej (Słowo + Pozycja)
+		local sequence_matrix = {}
+		local matrix_count = 0
+
+		for i = start_idx, current_seq_len do
+			task.wait()
+			matrix_count = matrix_count + 1
+			local token_id = generated_tokens[i]
+
+			local token_emb = getEmbedding(token_id)
+			local pos_emb = Config.PositionalEmbedding[matrix_count] or zeroVector()
+
+			for d = 1, Config.D do
+				token_emb[d] = token_emb[d] + pos_emb[d]
+			end
+
+			sequence_matrix[matrix_count] = token_emb
+		end
+
+		-- 2. Przepływ przez Transformera
+		local transformer_output = MHA.Forward(sequence_matrix)
+		local last_token_features = transformer_output[matrix_count]
+
+		-- ZABEZPIECZENIE: Jeśli z jakiegoś powodu transformer zwrócił pusty wektor cech
+		if not last_token_features then
+			last_token_features = zeroVector()
+		end
+
+		-- 3. Obliczanie logitów (LM Head)
+		local lm_head = Config.LM_Head
+		local lm_w = lm_head and lm_head.weights
+		local lm_b = lm_head and lm_head.biases or {}
+		local vocab_size = #Config.Vocab
+
+		for t_id = 1, vocab_size do
+			local w_t = lm_w and lm_w[t_id]
+			local logit = lm_b[t_id] or 0.0
+
+			-- ZABEZPIECZENIE (Naprawa błędu z linii 142):
+			-- Jeśli brakuje wag wyjściowych dla tego słowa, podstawiamy bezpieczne zera
+			if not w_t then
+				w_t = zeroVector()
+			end
+
+			for d = 1, Config.D do
+				logit = logit + last_token_features[d] * w_t[d]
+			end
+
+			logits_buffer[t_id] = logit
+		end
+
+		-- 4. Zastosowanie temperatury + Softmax -> Losowanie tokenu
+		SoftmaxWithTemperature(logits_buffer, temperature)
+		local chosen_token_id = SampleFromProbabilities(logits_buffer)
+
+		table.insert(generated_tokens, chosen_token_id)
+		if chosen_token_id == stop_token_id then break end
+	end
+
+	return Tokenizer.Decode(generated_tokens)
+end
+
+return module
